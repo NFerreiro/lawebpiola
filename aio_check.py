@@ -43,6 +43,7 @@ API = "https://api.dataforseo.com"
 COSTO_POR_KEYWORD = 0.0006          # cola Standard, depth 10, resultado Advanced
 COSTO_POR_KEYWORD_ASYNC = 0.0012    # con load_async_ai_overview activado
 TAREAS_POR_POST = 100               # maximo que acepta DataForSEO por request
+LOTE_CALIBRACION = 20               # primer lote chico, para medir el costo real
 SEMILLA_ORDEN = 42                  # fija el orden estratificado para siempre
 
 COL_KEYWORD = 0
@@ -244,16 +245,26 @@ def siguiente_numero_corrida(hechos):
 # --------------------------------------------------------------------------
 
 def tiene_ai_overview(resultado):
-    """True si el SERP incluye un AI Overview.
+    """True si el SERP incluye un AI Overview propiamente dicho.
 
     Se mira `item_types`, que DataForSEO completa con "ai_overview" incluso
     cuando el overview es asincronico y su contenido viene vacio. Como respaldo
-    tambien se recorre `items` por si la estructura cambia.
+    se recorren los items de primer nivel por si la estructura cambia.
+
+    OJO con los falsos positivos: dentro de `people_also_ask`, cada pregunta
+    puede traer un `people_also_ask_ai_overview_expanded_element`. Ese es el
+    mini-resumen que Google muestra al desplegar una pregunta del PAA, NO un AI
+    Overview del SERP, y no debe contar. Por eso la busqueda es por igualdad
+    exacta contra "ai_overview" y solo sobre items de primer nivel: nunca por
+    substring ni recursiva. Verificado el 26/08/2026 contra el SERP real de
+    Argentina: "freidoras" trae 4 de esos elementos anidados y ningun AI
+    Overview, mientras que "como elegir una freidora de aire" si trae el item
+    ai_overview de primer nivel.
     """
     tipos = resultado.get("item_types") or []
-    if "ai_overview" in tipos:
+    if "ai_overview" in tipos:                   # igualdad exacta, no substring
         return True
-    for item in resultado.get("items") or []:
+    for item in resultado.get("items") or []:    # solo primer nivel
         if isinstance(item, dict) and item.get("type") == "ai_overview":
             return True
     return False
@@ -263,13 +274,42 @@ def tiene_ai_overview(resultado):
 # Corrida
 # --------------------------------------------------------------------------
 
-def postear_tareas(cliente, keywords, cfg, corrida):
-    """Envia las keywords a la cola y devuelve {task_id: keyword}."""
-    pendientes = {}
-    total_lotes = (len(keywords) + TAREAS_POR_POST - 1) // TAREAS_POR_POST
+def postear_tareas(cliente, keywords, cfg, corrida, presupuesto=None):
+    """Envia las keywords a la cola respetando el presupuesto.
 
-    for n_lote, inicio in enumerate(range(0, len(keywords), TAREAS_POR_POST), start=1):
-        lote = keywords[inicio:inicio + TAREAS_POR_POST]
+    No confia en el precio de lista: manda un primer lote chico, lee el campo
+    `cost` que DataForSEO devuelve en la respuesta y recien ahi calcula cuantas
+    keywords mas entran en lo que queda del presupuesto. Asi la corrida se
+    ajusta sola aunque la tarifa de la cuenta no sea la esperada.
+
+    Devuelve ({task_id: keyword}, gastado_usd, costo_real_por_keyword).
+    """
+    pendientes = {}
+    gastado = 0.0
+    costo_kw = None          # None hasta que la API nos diga el costo real
+    i = 0
+
+    while i < len(keywords):
+        if costo_kw is None:
+            # Lote de calibracion: chico, para arriesgar poco si la tarifa
+            # resulta ser mas alta de lo previsto.
+            tam = min(LOTE_CALIBRACION, len(keywords) - i)
+            if presupuesto is not None:
+                tam = min(tam, max(1, int(presupuesto / COSTO_POR_KEYWORD)))
+        else:
+            tam = min(TAREAS_POR_POST, len(keywords) - i)
+            if presupuesto is not None:
+                caben = int((presupuesto - gastado) / costo_kw)
+                if caben <= 0:
+                    log("Presupuesto agotado (USD %.4f). Se cortan los envios: "
+                        "quedan %d keywords para la proxima corrida."
+                        % (gastado, len(keywords) - i))
+                    break
+                tam = min(tam, caben)
+
+        lote = keywords[i:i + tam]
+        i += tam
+
         tareas = []
         for kw in lote:
             tarea = {
@@ -300,10 +340,30 @@ def postear_tareas(cliente, keywords, cfg, corrida):
             else:
                 log("  no se pudo crear la tarea de '%s': %s %s"
                     % (kw_tarea, t.get("status_code"), t.get("status_message")))
-        log("Lote %d/%d: %d/%d tareas creadas" % (n_lote, total_lotes, creadas, len(lote)))
+
+        # Costo real de este request, tal como lo cobro DataForSEO.
+        try:
+            costo_lote = float(respuesta.get("cost") or 0.0)
+        except (TypeError, ValueError):
+            costo_lote = 0.0
+        if costo_lote <= 0:
+            # Algunas cuentas no reportan `cost`; se cae al precio de lista.
+            costo_lote = creadas * COSTO_POR_KEYWORD
+        gastado += costo_lote
+
+        if creadas and costo_kw is None:
+            costo_kw = costo_lote / creadas
+            log("Costo real medido: USD %.6f por keyword (esperado %.6f)"
+                % (costo_kw, COSTO_POR_KEYWORD))
+            if costo_kw > COSTO_POR_KEYWORD * 1.5:
+                log("AVISO: la tarifa real es mas alta de lo previsto. "
+                    "La corrida se achica sola para no pasarse del presupuesto.")
+
+        log("Enviadas %d/%d keywords | gastado USD %.4f"
+            % (len(pendientes), len(keywords), gastado))
         time.sleep(0.3)   # margen holgado frente al limite de 2.000 requests/minuto
 
-    return pendientes
+    return pendientes, gastado, (costo_kw or COSTO_POR_KEYWORD)
 
 
 def recolectar(cliente, pendientes, espera_max_min):
@@ -481,6 +541,10 @@ def main():
     p.add_argument("--load-async", action="store_true",
                    help="Carga tambien el contenido de los AI Overviews asincronicos. "
                         "Duplica el costo a USD 0.0012 por keyword; no hace falta para saber Si/No.")
+    p.add_argument("--presupuesto", type=float, default=1.0,
+                   help="Tope de gasto en USD para esta corrida (default: 1.0). "
+                        "Se mide con el costo real que devuelve DataForSEO, no con el "
+                        "precio de lista: si la tarifa fuera mas alta, la corrida se achica sola.")
     p.add_argument("--espera-max", type=int, default=90,
                    help="Minutos maximos de espera por la cola Standard (default: 90)")
     p.add_argument("--dry-run", action="store_true",
@@ -517,8 +581,18 @@ def main():
         log("No queda ninguna keyword pendiente. Ya esta todo el archivo procesado.")
         return
 
-    lote = pendientes_kw[:args.cantidad]
     costo_unitario = COSTO_POR_KEYWORD_ASYNC if args.load_async else COSTO_POR_KEYWORD
+    if args.presupuesto <= 0:
+        raise SystemExit("--presupuesto debe ser mayor que 0.")
+
+    # El tope de keywords es el menor entre lo pedido y lo que entra en el
+    # presupuesto. El corte fino lo hace postear_tareas con el costo real.
+    cabe_en_presupuesto = int(args.presupuesto / costo_unitario)
+    lote = pendientes_kw[:min(args.cantidad, cabe_en_presupuesto)]
+    if not lote:
+        raise SystemExit(
+            "Con un presupuesto de USD %.4f no entra ninguna keyword "
+            "(costo estimado USD %.4f cada una)." % (args.presupuesto, costo_unitario))
     costo = len(lote) * costo_unitario
 
     cfg = {
@@ -531,6 +605,7 @@ def main():
     print("-" * 62)
     print("Keywords en esta corrida : %d" % len(lote))
     print("Mercado                  : %s / %s / %s" % (args.location, args.language, args.device))
+    print("Presupuesto de la corrida: USD %.4f" % args.presupuesto)
     print("Costo estimado           : USD %.4f  (%.4f por keyword)" % (costo, costo_unitario))
     print("Primeras 5               : %s" % ", ".join(lote[:5]))
     print("-" * 62 + "\n")
@@ -544,6 +619,7 @@ def main():
 
     saldo = cliente.saldo()
     log("Cuenta %s | saldo USD %.4f" % (login, saldo))
+    presupuesto = min(args.presupuesto, saldo)
     if saldo < costo and not args.sin_chequeo_saldo:
         maximo = int(saldo / costo_unitario)
         raise SystemExit(
@@ -555,7 +631,8 @@ def main():
     inicio = time.time()
     try:
         log("Enviando %d keywords a la cola Standard..." % len(lote))
-        pendientes = postear_tareas(cliente, lote, cfg, corrida)
+        pendientes, gastado, costo_real = postear_tareas(
+            cliente, lote, cfg, corrida, presupuesto)
         if not pendientes:
             raise SystemExit("No se creo ninguna tarea. Revisa las credenciales y el saldo.")
 
@@ -613,6 +690,12 @@ def main():
             % len(no_resueltas))
 
     restantes = len(pendientes_kw) - len(resueltos)
+    print("Gasto real            : USD %.4f  (USD %.6f por keyword, segun DataForSEO)"
+          % (gastado, costo_real))
+    try:
+        print("Saldo restante        : USD %.4f" % cliente.saldo())
+    except RuntimeError:
+        pass
     print("Excel de esta corrida : %s" % ruta_corrida)
     print("Excel consolidado     : %s" % ruta_cons)
     print("(cada uno tiene su espejo en .csv en la misma carpeta)")
