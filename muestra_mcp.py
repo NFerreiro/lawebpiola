@@ -35,9 +35,25 @@ MERCADO = "Argentina / es / mobile"
 CAMPOS = ["keyword", "ai_overview", "fecha_utc", "mercado"]
 
 
-def orden_keywords():
+def orden_filas():
     with open(ARCHIVO_ORDEN, encoding="utf-8-sig", newline="") as fh:
-        return [r["keyword"] for r in csv.DictReader(fh)]
+        return list(csv.DictReader(fh))
+
+
+def orden_keywords():
+    return [r["keyword"] for r in orden_filas()]
+
+
+def pesos_verticales():
+    """Participacion real de cada vertical en las 13.065 keywords."""
+    filas = orden_filas()
+    tot = len(filas)
+    cuenta = Counter(r["vertical"] for r in filas)
+    return {v: n / tot for v, n in cuenta.items()}, cuenta
+
+
+def vertical_por_keyword():
+    return {r["keyword"].strip().lower(): r["vertical"] for r in orden_filas()}
 
 
 def cargar():
@@ -52,10 +68,41 @@ def cargar():
     return hechas
 
 
-def cmd_siguientes(n):
+def cmd_siguientes(n, balanceado=True):
+    """Proximas keywords a consultar.
+
+    Con cuota pareja (`balanceado`) se rota entre verticales, tomando de cada
+    uno en el orden estratificado ya versionado. Asi cada vertical acumula una
+    cantidad parecida de keywords y se puede leer su porcentaje por separado,
+    incluso en los verticales chicos como Autos y Motos (1,4% del archivo).
+    El total global se recompone despues re-ponderando por el peso real de
+    cada vertical: ver cmd_estado.
+    """
     hechas = cargar()
-    faltan = [kw for kw in orden_keywords() if kw.strip().lower() not in hechas]
-    for kw in faltan[:n]:
+    colas = OrderedDict()
+    for r in orden_filas():
+        if r["keyword"].strip().lower() in hechas:
+            continue
+        colas.setdefault(r["vertical"], []).append(r["keyword"])
+
+    if not balanceado:
+        faltan = [kw for kw in orden_keywords() if kw.strip().lower() not in hechas]
+        for kw in faltan[:n]:
+            print(kw)
+        return
+
+    # Se arranca por el vertical con menos keywords ya relevadas, para que la
+    # cuota se empareje aunque una tanda se haya cortado por la mitad.
+    v_de = vertical_por_keyword()
+    ya = Counter(v_de.get(kw, "") for kw in hechas)
+    salida = []
+    while len(salida) < n and any(colas.values()):
+        for v in sorted(colas, key=lambda v: (ya[v], v)):
+            if not colas[v] or len(salida) >= n:
+                continue
+            salida.append(colas[v].pop(0))
+            ya[v] += 1
+    for kw in salida:
         print(kw)
 
 
@@ -89,11 +136,73 @@ def cmd_anotar(pares):
           % (nuevas, (", %d repetidas ignoradas" % repetidas) if repetidas else "", len(hechas)))
 
 
-def margen_error(n, p):
-    """Semiancho del intervalo de confianza al 95%, en puntos porcentuales."""
+Z = 1.96   # 95% de confianza
+
+
+def intervalo_wilson(n, x):
+    """Intervalo de confianza al 95% para una proporcion, en porcentaje.
+
+    Se usa Wilson y no el clasico p +/- z*sqrt(p(1-p)/n) porque ese ultimo
+    colapsa a +/- 0 cuando la muestra da 0% o 100%, que es justo lo que pasa
+    con los verticales chicos al principio del relevamiento. Con 0 de 5 la
+    respuesta honesta no es "0% +/- 0", es "entre 0% y 43%".
+    """
     if n == 0:
-        return 100.0
-    return 100 * 1.96 * ((p * (1 - p) / n) ** 0.5)
+        return 0.0, 100.0
+    p = x / n
+    denom = 1 + Z * Z / n
+    centro = (p + Z * Z / (2 * n)) / denom
+    semi = (Z / denom) * ((p * (1 - p) / n + Z * Z / (4 * n * n)) ** 0.5)
+    return 100 * max(0.0, centro - semi), 100 * min(1.0, centro + semi)
+
+
+def p_ajustada(n, x):
+    """Proporcion de Agresti-Coull: (x + z^2/2) / (n + z^2).
+
+    Evita que un estrato con 0 o 100% aporte varianza cero al total ponderado.
+    """
+    if n == 0:
+        return 0.5
+    return (x + Z * Z / 2) / (n + Z * Z)
+
+
+def estimacion_ponderada(por_vertical):
+    """(porcentaje, margen) del total, re-pesando cada vertical por su peso real.
+
+    La muestra tiene cuota pareja, no proporcional, asi que el promedio simple
+    sobreestimaria los verticales chicos. El estimador correcto es
+    p = suma(W_v * p_v), con W_v = participacion del vertical en las 13.065.
+    El error se propaga como suma(W_v^2 * p_v*(1-p_v)/n_v).
+    """
+    pesos, _ = pesos_verticales()
+    p = var = 0.0
+    peso_cubierto = 0.0
+    for v, (n, con) in por_vertical.items():
+        if not n:
+            continue
+        w = pesos.get(v, 0.0)
+        p += w * (con / n)
+        # La varianza usa la proporcion ajustada para que un estrato con 0%
+        # o 100% no aporte incertidumbre cero.
+        pa = p_ajustada(n, con)
+        var += (w ** 2) * pa * (1 - pa) / n
+        peso_cubierto += w
+    if peso_cubierto <= 0:
+        return 0.0, 100.0, 0.0
+    # Se renormaliza por si algun vertical todavia no tiene ninguna keyword.
+    p /= peso_cubierto
+    margen = 100 * Z * (var ** 0.5) / peso_cubierto
+    return 100 * p, margen, 100 * peso_cubierto
+
+
+def desglose(hechas):
+    v_de = vertical_por_keyword()
+    por_vertical = OrderedDict()
+    for kw, val in hechas.items():
+        v = v_de.get(kw, "(sin dato)")
+        n, con = por_vertical.get(v, (0, 0))
+        por_vertical[v] = (n + 1, con + (1 if val == "Si" else 0))
+    return por_vertical
 
 
 def cmd_estado():
@@ -103,12 +212,25 @@ def cmd_estado():
     print("Keywords relevadas : %d de 13.065" % n)
     print("Gasto estimado     : USD %.4f  (USD %.4f por keyword, Live Advanced)"
           % (n * COSTO_LIVE, COSTO_LIVE))
-    if n:
-        p = con / n
-        print("Con AI Overview    : %d  (%.1f%%)" % (con, 100 * p))
-        print("Sin AI Overview    : %d  (%.1f%%)" % (n - con, 100 * (1 - p)))
-        print("Margen de error    : +/- %.1f puntos porcentuales (95%% de confianza)"
-              % margen_error(n, p))
+    if not n:
+        return
+
+    por_vertical = desglose(hechas)
+    print("\nPor vertical (cuota pareja):")
+    _, cuenta = pesos_verticales()
+    for v, (nv, cv) in sorted(por_vertical.items(), key=lambda x: -x[1][0]):
+        lo, hi = intervalo_wilson(nv, cv)
+        print("  %-26s %4d kw   %5.1f%% con AIO   IC95%%: %4.1f%% - %4.1f%%   (vertical real: %d kw)"
+              % (v, nv, 100.0 * cv / nv, lo, hi, cuenta.get(v, 0)))
+
+    p, margen, cubierto = estimacion_ponderada(por_vertical)
+    lo, hi = intervalo_wilson(n, con)
+    print("\nCrudo de la muestra       : %.1f%% con AI Overview (%d de %d), IC95%%: %.1f%% - %.1f%%"
+          % (100.0 * con / n, con, n, lo, hi))
+    print("Estimacion para las 13.065: %.1f%% +/- %.1f pp (95%%), re-ponderado por vertical"
+          % (p, margen))
+    if cubierto < 99.9:
+        print("  (cubre el %.1f%% del archivo: faltan verticales sin relevar)" % cubierto)
 
 
 def cmd_excel():
@@ -140,19 +262,17 @@ def cmd_excel():
         w.writerow(headers)
         w.writerows(salida)
 
-    con = sum(1 for f in salida if f[4] == "Si")
-    n = len(salida)
     print("Excel  : %s" % ruta)
-    print("CSV    : %s" % (ruta[:-5] + ".csv"))
-    print("Filas  : %d  |  con AI Overview: %d (%.1f%%)  +/- %.1f pp"
-          % (n, con, 100.0 * con / n, margen_error(n, con / n)))
+    print("CSV    : %s\n" % (ruta[:-5] + ".csv"))
+    cmd_estado()
 
-    for etiqueta, idx in (("Por vertical", 1), ("Por tipo de keyword", 2)):
-        print("\n%s:" % etiqueta)
-        tot = Counter(f[idx] for f in salida)
-        si = Counter(f[idx] for f in salida if f[4] == "Si")
-        for clave, cant in tot.most_common():
-            print("  %-26s %4d kw   %5.1f%% con AIO" % (clave, cant, 100.0 * si[clave] / cant))
+    print("\nPor tipo de keyword:")
+    tot = Counter(f[2] for f in salida)
+    si = Counter(f[2] for f in salida if f[4] == "Si")
+    for clave, cant in tot.most_common():
+        lo, hi = intervalo_wilson(cant, si[clave])
+        print("  %-26s %4d kw   %5.1f%% con AIO   IC95%%: %4.1f%% - %4.1f%%"
+              % (clave, cant, 100.0 * si[clave] / cant, lo, hi))
 
 
 if __name__ == "__main__":
