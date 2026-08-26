@@ -1,0 +1,9 @@
+# Credenciales de DataForSEO: nunca se versionan
+credenciales.txt
+.env
+
+# Excels y CSV generados en cada corrida
+salidas/
+
+__pycache__/
+*.pyc
